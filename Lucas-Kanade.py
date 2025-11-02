@@ -15,8 +15,10 @@ import sys
 import os
 import mmap
 import struct
+import json
+from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Deque, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -37,9 +39,9 @@ class TrackerConfig:
     )
     redetectEveryNFrames: int = 35
     minTrackedPoints: int = 25
-    minAngleSamples: int = 12
+    minAngleSamples: int = 8
     SmoothAlpha: float = 0.15
-    nearZeroThresholdDeg: float = 0.4
+    nearZeroThresholdDeg: float = 0.05
     maxAngleStdDeg: float = 6.0
     GradientJumpThreshold: float = 12.0
     motionAngleThresholdDeg: float = 9.0  #T_θ in paper
@@ -48,6 +50,24 @@ class TrackerConfig:
     alignBackToZeroDeg: float = 0.8
     allowManualClick: bool = True
     debugMode: bool = False
+    maskOuterFraction: float = 0.97
+    maskInnerFraction: float = 0.52
+    debugPrintEvery: int = 30
+    debugHistorySize: int = 180
+    debugHistogramRangeDeg: Tuple[float, float] = (-30.0, 30.0)
+    debugDumpDir: Optional[str] = "debug_dump"
+    debugDumpEvery: int = 5
+    wheelRefreshIntervalFrames: int = 360
+    wheelMaxCenterShiftPx: float = 28.0
+    wheelMaxRadiusScaleChange: float = 0.12
+    rejectSkinFeatures: bool = True
+    skinHueRangeLow: Tuple[int, int] = (0, 25)  #inclusive
+    skinHueRangeHigh: Tuple[int, int] = (160, 180)
+    minSkinSaturation: int = 40
+    maxSkinValue: int = 255
+    showWindows: bool = True
+    alignZeroFrameThreshold: int = 45
+    alignZeroMaxAbsAngle: float = 120.0
 
 
 class SteeringLKTracker:
@@ -56,6 +76,8 @@ class SteeringLKTracker:
         self.center: Optional[np.ndarray] = None
         self.radius: Optional[float] = None
         self.mask: Optional[np.ndarray] = None
+        self.innerRadius: Optional[float] = None
+        self.outerRadius: Optional[float] = None
 
         #state that evolves per frame
         self.prevGray: Optional[np.ndarray] = None
@@ -73,6 +95,18 @@ class SteeringLKTracker:
         self.shmMap: Optional[mmap.mmap] = None
         self.shmPath = "/dev/shm/steering_angle"
         self.shmSize = 8  #double buffer only
+        historySize = max(1, self.cfg.debugHistorySize)
+        self.debugHistory: Deque["SteeringLKTracker.DebugFrameStats"] = deque(maxlen=historySize)
+        self.latestDebugStats: Optional["SteeringLKTracker.DebugFrameStats"] = None
+        if self.cfg.debugMode and self.cfg.debugDumpDir:
+            dumpPath = os.path.abspath(self.cfg.debugDumpDir)
+            os.makedirs(dumpPath, exist_ok=True)
+            self._debugDumpDir: Optional[str] = dumpPath
+        else:
+            self._debugDumpDir = None
+        self.maxFrames: Optional[int] = None
+        self.lastWheelRefreshFrame: int = 0
+        self.rectZeroStreak: int = 0
 
     def resetDetection(
         self,
@@ -99,7 +133,14 @@ class SteeringLKTracker:
             self.center = None
             self.radius = None
             self.mask = None
+            self.innerRadius = None
+            self.outerRadius = None
         self.lastPeriodicResetFrame = self.frameIdx
+        self.lastWheelRefreshFrame = self.frameIdx
+        self.rectZeroStreak = 0
+        self.latestDebugStats = None
+        if self.cfg.debugMode:
+            self.debugHistory.clear()
 
         if currentFrame is None:
             return
@@ -173,7 +214,7 @@ class SteeringLKTracker:
             os.close(self.shmFd)
             self.shmFd = None
 
-    def run(self, videoSource: str) -> None:
+    def run(self, videoSource: str, maxFrames: Optional[int] = None) -> None:
         cap = cv2.VideoCapture(videoSource)
         if not cap.isOpened():
             print(f"Cannot open video: {videoSource}", file=sys.stderr)
@@ -206,6 +247,7 @@ class SteeringLKTracker:
         self.prevPts = self._detect_features(gray, useMask=True)
         self.prevPts = self.prevPts.reshape(-1, 2) if self.prevPts is not None else np.empty((0, 2))
         self.frameIdx = 0
+        self.maxFrames = maxFrames
         self.angleDeg = 0.0
         self.smoothedAngle = 0.0
         self.motionType = "rect"
@@ -225,41 +267,44 @@ class SteeringLKTracker:
             if not ok:
                 break
             self.frameIdx += 1
-            timeSec = self.frameIdx / fps
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             measurement = self._process_frame(gray, frame=frame)
             self._apply_measurement(measurement)
             self._maybe_reseed(gray, force=measurement.forceReseed)
+            self._maybe_refresh_wheel_geometry(frame)
 
-            vis = self._draw_overlay(frame.copy())
-            cv2.imshow("steering-lk", vis)
+            if self.cfg.showWindows:
+                vis = self._draw_overlay(frame.copy(), measurement)
+                cv2.imshow("steering-lk", vis)
+
             if measurement.valid:
                 self._writeSharedAngle(float(self.smoothedAngle))
             else:
                 self._writeSharedAngle(float("nan"))
 
             self.prevGray = gray
-            self.prevPts = measurement.nextPoints.reshape(-1, 2) if measurement.nextPoints is not None else np.empty((0, 2))
-
             if (
-                self.periodicResetIntervalFrames > 0
-                and self.frameIdx - self.lastPeriodicResetFrame >= self.periodicResetIntervalFrames
+                measurement.nextPoints is not None
+                and len(measurement.nextPoints) >= self.cfg.minTrackedPoints
             ):
-                self.resetDetection(
-                    resetAngle=False,
-                    wheelDetectionReset=False,
-                    currentFrame=frame,
-                )
+                self.prevPts = measurement.nextPoints.reshape(-1, 2)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27:  # ESC
+            if self.maxFrames is not None and self.frameIdx >= self.maxFrames:
+                if self.cfg.debugMode:
+                    print(f"[dbg] reached max frame limit {self.maxFrames}")
                 break
-            if key == ord("r"):
-                self.resetDetection(resetAngle=True, wheelDetectionReset=True, currentFrame=frame)
+
+            if self.cfg.showWindows:
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:  # ESC
+                    break
+                if key == ord("r"):
+                    self.resetDetection(resetAngle=True, wheelDetectionReset=True, currentFrame=frame)
 
         cap.release()
-        cv2.destroyAllWindows()
+        if self.cfg.showWindows:
+            cv2.destroyAllWindows()
         self._writeSharedAngle(float("nan"))  #tell downstream we're idle now.
         self._closeSharedMem()
 
@@ -268,6 +313,7 @@ class SteeringLKTracker:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         print("Hough circle start...") 
         blurred = cv2.medianBlur(gray, 5)
+        detectionSource = "hough"
         circles = cv2.HoughCircles(
             blurred,
             cv2.HOUGH_GRADIENT,
@@ -286,21 +332,20 @@ class SteeringLKTracker:
         elif self.cfg.allowManualClick:
             print("Can't find wheel. Click center then rim.")
             self.center, self.radius = self._manual_select_center(frame)
+            detectionSource = "manual"
         else:
             self.center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
             self.radius = min(h, w) * 0.25
             print("Automatic detection failed; using frame centre heuristic.")
+            detectionSource = "fallback"
 
         if self.center is None or self.radius is None:
             self.center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
             self.radius = min(h, w) * 0.25
             print("Falling back to frame centre due to missing clicks.")
+            detectionSource = "fallback"
 
-        self.mask = np.zeros_like(gray)
-        outerR = int(self.radius * 0.97)
-        innerR = int(self.radius * 0.52)
-        cv2.circle(self.mask, (int(self.center[0]), int(self.center[1])), outerR, 255, -1)
-        cv2.circle(self.mask, (int(self.center[0]), int(self.center[1])), innerR, 0, -1)
+        self._rebuild_mask(frameShape=(h, w), stage="initial", detectionSource=detectionSource)
 
     def _manual_select_center(self, frame: np.ndarray) -> Tuple[np.ndarray, float]:
         coords: List[Tuple[int, int]] = []
@@ -343,42 +388,162 @@ class SteeringLKTracker:
         )
         return p0
 
+    def _rebuild_mask(self, frameShape: Tuple[int, int], stage: str, detectionSource: str) -> None:
+        if self.center is None or self.radius is None:
+            return
+        self.outerRadius = float(self.radius * self.cfg.maskOuterFraction)
+        self.innerRadius = float(self.radius * self.cfg.maskInnerFraction)
+        if self.innerRadius >= self.outerRadius:
+            self.innerRadius = max(self.outerRadius * 0.5, 1.0)
+
+        h, w = frameShape
+        blank = np.zeros((h, w), dtype=np.uint8)
+        self.mask = blank
+        outerR = max(1, int(round(self.outerRadius)))
+        innerR = max(1, int(round(self.innerRadius)))
+        innerR = min(innerR, max(outerR - 2, 1))
+        cv2.circle(self.mask, (int(self.center[0]), int(self.center[1])), outerR, 255, -1)
+        cv2.circle(self.mask, (int(self.center[0]), int(self.center[1])), innerR, 0, -1)
+        self._dump_wheel_geometry(stage=stage, detectionSource=detectionSource, frameShape=frameShape)
+
+    def _dump_wheel_geometry(self, stage: str, detectionSource: str, frameShape: Tuple[int, int]) -> None:
+        if not self.cfg.debugMode or self._debugDumpDir is None:
+            return
+        data = {
+            "frameIdx": int(self.frameIdx),
+            "stage": stage,
+            "detectionSource": detectionSource,
+            "center": self.center.tolist() if self.center is not None else None,
+            "radius": float(self.radius) if self.radius is not None else None,
+            "innerRadius": float(self.innerRadius) if self.innerRadius is not None else None,
+            "outerRadius": float(self.outerRadius) if self.outerRadius is not None else None,
+            "maskOuterFraction": float(self.cfg.maskOuterFraction),
+            "maskInnerFraction": float(self.cfg.maskInnerFraction),
+            "frameShape": [int(frameShape[0]), int(frameShape[1])],
+        }
+        path = os.path.join(
+            self._debugDumpDir,
+            f"wheel_geometry_{stage}_{self.frameIdx:06d}.json",
+        )
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, separators=(",", ":"))
+        except OSError as dumpErr:
+            if self.cfg.debugMode:
+                print(f"[dbg] failed to dump wheel geometry: {dumpErr}")
+
     @dataclass
     class Measurement:
         valid: bool
         relativeAngle: float
         nextPoints: np.ndarray
         trackedPoints: int
+        rawTrackedPoints: int
         forceReseed: bool
         motionType: str
         RawCandidates: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=np.float32))
+        invalidReason: Optional[str] = None
+        pointInsideMask: Optional[np.ndarray] = None
+        pointRadii: Optional[np.ndarray] = None
+        appearanceAccepted: Optional[np.ndarray] = None
+        maskRejectedCount: int = 0
+        appearanceRejectedCount: int = 0
+        medianAngle: float = 0.0
+
+    @dataclass
+    class DebugFrameStats:
+        frameIdx: int
+        trackedPoints: int
+        rawTrackedPoints: int
+        inMask: int
+        outOfMask: int
+        maskRejected: int
+        appearanceRejected: int
+        relativeAngle: float
+        smoothedAngle: float
+        motionType: str
+        measurementValid: bool
+        invalidReason: Optional[str]
+        angleMedian: Optional[float]
+        angleStd: Optional[float]
+        sampleCount: int
+        positiveCount: int
+        negativeCount: int
+        noiseFlag: bool
 
     def _process_frame(self, gray: np.ndarray, frame: Optional[np.ndarray] = None) -> "SteeringLKTracker.Measurement":
         if self.prevGray is None:
-            return self.Measurement(
+            measurement = self.Measurement(
                 valid=False,
                 relativeAngle=0.0,
                 nextPoints=self.prevPts,
                 trackedPoints=len(self.prevPts),
+                rawTrackedPoints=len(self.prevPts),
                 forceReseed=True,
                 motionType=self.motionType,
+                invalidReason="bootstrap",
+                medianAngle=0.0,
             )
+            self._record_frame_debug(
+                measurement=measurement,
+                stats=None,
+                angleDeltas=None,
+                inMask=None,
+                noiseFlag=False,
+            )
+            return measurement
 
         nextPts, prevPtsValid = self._track_points(self.prevGray, gray, self.prevPts)
+        rawTrackedPoints = len(nextPts)
+        inMaskFlags, radii = self._split_points_by_annulus(nextPts)
+
+        maskRejectedCount = int((~inMaskFlags).sum()) if inMaskFlags is not None and len(inMaskFlags) else 0
+        if inMaskFlags is not None and len(inMaskFlags):
+            nextPts = nextPts[inMaskFlags]
+            prevPtsValid = prevPtsValid[inMaskFlags]
+            radii = radii[inMaskFlags]
+            inMaskFlags = np.ones(len(nextPts), dtype=bool)
+
+        if frame is not None and len(nextPts) > 0:
+            appearanceMask = self._filter_points_by_appearance(frame, nextPts)
+            appearanceRejectedCount = int((~appearanceMask).sum())
+            if appearanceRejectedCount:
+                nextPts = nextPts[appearanceMask]
+                prevPtsValid = prevPtsValid[appearanceMask]
+                radii = radii[appearanceMask]
+            appearanceAccepted = np.ones(len(nextPts), dtype=bool)
+        else:
+            appearanceMask = None
+            appearanceRejectedCount = 0
+            appearanceAccepted = np.ones(len(nextPts), dtype=bool)
+
         trackedPoints = len(nextPts)
-        ptsOk = trackedPoints  #v2 of angle calc uses this count differently.
-        if self.cfg.debugMode and self.frameIdx % 7 == 0:
-            print(ptsOk) 
 
         if trackedPoints < self.cfg.minTrackedPoints:
-            return self.Measurement(
+            measurement = self.Measurement(
                 valid=False,
                 relativeAngle=0.0,
                 nextPoints=nextPts,
                 trackedPoints=trackedPoints,
+                rawTrackedPoints=rawTrackedPoints,
                 forceReseed=True,
                 motionType=self.motionType,
+                invalidReason="few-tracks",
+                pointInsideMask=inMaskFlags,
+                pointRadii=radii,
+                appearanceAccepted=appearanceAccepted,
+                maskRejectedCount=maskRejectedCount,
+                appearanceRejectedCount=appearanceRejectedCount,
+                medianAngle=0.0,
             )
+            self._record_frame_debug(
+                measurement=measurement,
+                stats=None,
+                angleDeltas=None,
+                inMask=inMaskFlags,
+                noiseFlag=False,
+            )
+            return measurement
 
         angleDeltas = self._compute_angleDeltas(prevPtsValid, nextPts)
         stats = self._angle_statistics(angleDeltas)
@@ -386,24 +551,42 @@ class SteeringLKTracker:
         motionType = self._classify_motion(stats, predictedAngle=self.angleDeg + stats.median)
         relativeAngle, measureValid = self._decide_relativeAngle(stats, motionType, noiseFlag)
 
-        if not measureValid and self.cfg.debugMode:
-            print(
-                f"[frame {self.frameIdx}] invalid measurement: "
-                f"pts={trackedPoints}, "
-                f"std={stats.std:.2f}, "
-                f"noise={noiseFlag}"
-            )
-            
+        invalidReason = None
+        if not measureValid:
+            if stats.sampleCount < self.cfg.minAngleSamples:
+                invalidReason = "few-angle-samples"
+            elif stats.std > self.cfg.maxAngleStdDeg:
+                invalidReason = "angle-std"
+            elif noiseFlag:
+                invalidReason = "noise-spike"
+            else:
+                invalidReason = "rule-reject"
 
-        return self.Measurement(
+        measurement = self.Measurement(
             valid=measureValid,
             relativeAngle=relativeAngle,
             nextPoints=nextPts,
             trackedPoints=trackedPoints,
+            rawTrackedPoints=rawTrackedPoints,
             forceReseed=trackedPoints < self.cfg.minTrackedPoints * 1.5,
             motionType=motionType,
             RawCandidates=angleDeltas,
+            invalidReason=invalidReason,
+            pointInsideMask=inMaskFlags,
+            pointRadii=radii,
+            appearanceAccepted=appearanceAccepted,
+            maskRejectedCount=maskRejectedCount,
+            appearanceRejectedCount=appearanceRejectedCount,
+            medianAngle=stats.median,
         )
+        self._record_frame_debug(
+            measurement=measurement,
+            stats=stats,
+            angleDeltas=angleDeltas,
+            inMask=inMaskFlags,
+            noiseFlag=noiseFlag,
+        )
+        return measurement
 
     def _apply_measurement(self, measurement: "SteeringLKTracker.Measurement") -> None:
         previousMotion = self.motionType
@@ -420,12 +603,46 @@ class SteeringLKTracker:
                 self.angleDeg += self.lastRelativeAngle
 
         self.angleDeg = self._maybe_align_zero(self.angleDeg)
-        self.angleHistory.append(self.angleDeg)
+
+        if measurement.trackedPoints >= self.cfg.minAngleSamples:
+            if abs(measurement.medianAngle) < self.cfg.alignBackToZeroDeg:
+                self.rectZeroStreak += 1
+            else:
+                self.rectZeroStreak = 0
+        else:
+            self.rectZeroStreak = 0
+
+        aligned = False
+        if (
+            self.rectZeroStreak >= self.cfg.alignZeroFrameThreshold
+            and abs(self.angleDeg) > self.cfg.alignBackToZeroDeg
+            and abs(self.angleDeg) <= self.cfg.alignZeroMaxAbsAngle
+        ):
+            if self.cfg.debugMode:
+                print(
+                    f"[dbg] align-to-zero at frame {self.frameIdx}: angle {self.angleDeg:.2f} deg"
+                )
+            self.angleDeg = 0.0
+            self.smoothedAngle = 0.0
+            self.lastRelativeAngle = 0.0
+            self.rectZeroStreak = 0
+            self.angleHistory = [0.0]
+            aligned = True
+
+        if not aligned:
+            self.angleHistory.append(self.angleDeg)
+
         self.motionType = measurement.motionType
         #TODO revisit smoothing once I trust calibration again.
-        alpha = 0.18
-        # alpha = self.cfg.SmoothAlpha
+        #alpha = 0.18
+        alpha = self.cfg.SmoothAlpha
         self.smoothedAngle = alpha * self.angleDeg + (1.0 - alpha) * self.smoothedAngle
+        if self.cfg.debugMode and self.latestDebugStats is not None:
+            self.latestDebugStats.relativeAngle = float(self.lastRelativeAngle)
+            self.latestDebugStats.smoothedAngle = float(self.smoothedAngle)
+            self.latestDebugStats.motionType = self.motionType
+            self.latestDebugStats.measurementValid = bool(measurement.valid)
+            self.latestDebugStats.invalidReason = measurement.invalidReason
 
     def _maybe_reseed(self, gray: np.ndarray, force: bool) -> None:
         needReseed = force or (self.frameIdx - self.lastReseedFrame > self.cfg.redetectEveryNFrames)
@@ -438,6 +655,72 @@ class SteeringLKTracker:
         if p0 is not None and len(p0) > 0:
             self.prevPts = p0.reshape(-1, 2)
             self.lastReseedFrame = self.frameIdx
+
+    def _maybe_refresh_wheel_geometry(self, frame: np.ndarray) -> None:
+        if self.cfg.wheelRefreshIntervalFrames <= 0:
+            return
+        if self.center is None or self.radius is None:
+            return
+        if self.frameIdx - self.lastWheelRefreshFrame < self.cfg.wheelRefreshIntervalFrames:
+            return
+
+        self.lastWheelRefreshFrame = self.frameIdx
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.medianBlur(gray, 5)
+        h, w = gray.shape[:2]
+        cx, cy = self.center
+        roiPad = int(self.radius * 1.4)
+        x0 = max(int(cx - roiPad), 0)
+        y0 = max(int(cy - roiPad), 0)
+        x1 = min(int(cx + roiPad), w)
+        y1 = min(int(cy + roiPad), h)
+        roi = blurred[y0:y1, x0:x1]
+
+        if roi.size == 0:
+            return
+
+        minRadius = int(max(20.0, self.radius * (1.0 - self.cfg.wheelMaxRadiusScaleChange)))
+        maxRadius = int(min(min(h, w) * 0.6, self.radius * (1.0 + self.cfg.wheelMaxRadiusScaleChange)))
+        if minRadius >= maxRadius:
+            maxRadius = minRadius + 5
+
+        circles = cv2.HoughCircles(
+            roi,
+            cv2.HOUGH_GRADIENT,
+            dp=1.1,
+            minDist=80,
+            param1=100,
+            param2=30,
+            minRadius=minRadius,
+            maxRadius=maxRadius,
+        )
+        if circles is None or len(circles) == 0:
+            if self.cfg.debugMode:
+                print(f"[dbg] wheel refresh failed: no circles at frame {self.frameIdx}")
+            return
+
+        cand = circles[0, 0]
+        newCenter = np.array([cand[0] + x0, cand[1] + y0], dtype=np.float32)
+        newRadius = float(cand[2])
+
+        shift = float(np.linalg.norm(newCenter - self.center))
+        radiusDiff = abs(newRadius - self.radius) / max(self.radius, 1e-3)
+
+        if shift > self.cfg.wheelMaxCenterShiftPx or radiusDiff > self.cfg.wheelMaxRadiusScaleChange * 1.5:
+            if self.cfg.debugMode:
+                print(
+                    f"[dbg] wheel refresh rejected: shift {shift:.1f}px radiusDelta {radiusDiff:.3f} at frame {self.frameIdx}"
+                )
+            return
+
+        self.center = newCenter
+        self.radius = newRadius
+        self._rebuild_mask(frameShape=(h, w), stage="refresh", detectionSource="hough-refresh")
+        if self.cfg.debugMode:
+            print(
+                f"[dbg] wheel refresh accepted at frame {self.frameIdx}: center shift {shift:.1f}px radius {newRadius:.1f}"
+            )
 
     def _track_points(
         self, prevGray: np.ndarray, gray: np.ndarray, prevPts: np.ndarray
@@ -458,6 +741,63 @@ class SteeringLKTracker:
         goodNew = p1[st.reshape(-1) == 1]
         goodOld = prevPts[st.reshape(-1) == 1]
         return goodNew, goodOld
+
+    def _split_points_by_annulus(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if points is None or len(points) == 0:
+            return np.zeros((0,), dtype=bool), np.zeros((0,), dtype=np.float32)
+        if (
+            self.center is None
+            or self.innerRadius is None
+            or self.outerRadius is None
+        ):
+            return np.ones(len(points), dtype=bool), np.linalg.norm(points, axis=1).astype(np.float32)
+        radii = np.linalg.norm(points - self.center, axis=1)
+        inMask = (radii >= self.innerRadius) & (radii <= self.outerRadius)
+        return inMask.astype(bool), radii.astype(np.float32)
+
+    def _filter_points_by_appearance(self, frame: np.ndarray, points: np.ndarray) -> np.ndarray:
+        if points is None or len(points) == 0:
+            return np.ones((0,), dtype=bool)
+        if not self.cfg.rejectSkinFeatures:
+            return np.ones(len(points), dtype=bool)
+
+        hsvFrame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hLow0, hHigh0 = self.cfg.skinHueRangeLow
+        hLow1, hHigh1 = self.cfg.skinHueRangeHigh
+        satMin = self.cfg.minSkinSaturation
+        valMax = self.cfg.maxSkinValue
+
+        mask = np.ones(len(points), dtype=bool)
+        height, width = hsvFrame.shape[:2]
+
+        for idx, pt in enumerate(points):
+            x = int(round(pt[0]))
+            y = int(round(pt[1]))
+            x0 = max(x - 2, 0)
+            y0 = max(y - 2, 0)
+            x1 = min(x + 3, width)
+            y1 = min(y + 3, height)
+            if x0 >= x1 or y0 >= y1:
+                continue
+
+            patch = hsvFrame[y0:y1, x0:x1]
+            if patch.size == 0:
+                continue
+
+            h = patch[:, :, 0]
+            s = patch[:, :, 1]
+            v = patch[:, :, 2]
+            cond0 = (h >= hLow0) & (h <= hHigh0)
+            cond1 = (h >= hLow1) & (h <= hHigh1)
+            hueMask = cond0 | cond1
+            satMask = s >= satMin
+            valMask = v <= valMax
+            skinPixels = hueMask & satMask & valMask
+
+            if np.mean(skinPixels) > 0.35:
+                mask[idx] = False
+
+        return mask
 
     @dataclass
     class AngleStats:
@@ -488,7 +828,16 @@ class SteeringLKTracker:
         mask = np.abs(deltaAngles) > self.cfg.nearZeroThresholdDeg
         filtered = deltaAngles[mask]
         if filtered.size == 0:
-            filtered = np.array([0.0], dtype=np.float32)
+            sampleCount = int(deltaAngles.size)
+            return self.AngleStats(
+                median=0.0,
+                std=0.0,
+                positiveMean=None,
+                negativeMean=None,
+                positiveCount=0,
+                negativeCount=0,
+                sampleCount=sampleCount,
+            )
 
         median = float(np.median(filtered))
         std = float(np.std(filtered))
@@ -560,14 +909,261 @@ class SteeringLKTracker:
             return 0.0
         return angle
 
-    def _draw_overlay(self, frame: np.ndarray) -> np.ndarray:
+    def _record_frame_debug(
+        self,
+        measurement: "SteeringLKTracker.Measurement",
+        stats: Optional["SteeringLKTracker.AngleStats"],
+        angleDeltas: Optional[np.ndarray],
+        inMask: Optional[np.ndarray],
+        noiseFlag: bool,
+    ) -> None:
+        if not self.cfg.debugMode:
+            return
+
+        if inMask is None and measurement.nextPoints is not None:
+            inMask, _ = self._split_points_by_annulus(measurement.nextPoints)
+
+        tracked = int(measurement.trackedPoints)
+        rawTracked = int(getattr(measurement, "rawTrackedPoints", tracked))
+        inCount = int(inMask.sum()) if inMask is not None else tracked
+        outCount = int(getattr(measurement, "maskRejectedCount", 0))
+        appearanceRejected = int(getattr(measurement, "appearanceRejectedCount", 0))
+
+        angleMedian = stats.median if stats is not None else None
+        angleStd = stats.std if stats is not None else None
+        positiveCount = stats.positiveCount if stats is not None else 0
+        negativeCount = stats.negativeCount if stats is not None else 0
+        sampleCount = stats.sampleCount if stats is not None else 0
+
+        debugEntry = self.DebugFrameStats(
+            frameIdx=self.frameIdx,
+            trackedPoints=tracked,
+            rawTrackedPoints=rawTracked,
+            inMask=inCount,
+            outOfMask=outCount,
+            maskRejected=outCount,
+            appearanceRejected=appearanceRejected,
+            relativeAngle=float(measurement.relativeAngle),
+            smoothedAngle=float(self.smoothedAngle),
+            motionType=measurement.motionType,
+            measurementValid=measurement.valid,
+            invalidReason=measurement.invalidReason,
+            angleMedian=angleMedian,
+            angleStd=angleStd,
+            sampleCount=sampleCount,
+            positiveCount=positiveCount,
+            negativeCount=negativeCount,
+            noiseFlag=noiseFlag,
+        )
+        self.latestDebugStats = debugEntry
+        self.debugHistory.append(debugEntry)
+
+        reason = measurement.invalidReason or "ok"
+        if (
+            self.cfg.debugPrintEvery > 0
+            and self.frameIdx % self.cfg.debugPrintEvery == 0
+        ):
+            print(
+                f"[dbg] frame {debugEntry.frameIdx:05d} "
+                f"tracked={tracked} raw={rawTracked} in={inCount} maskRej={outCount} skinRej={appearanceRejected} "
+                f"valid={measurement.valid} reason={reason} "
+                f"angle={measurement.relativeAngle:.2f} std={angleStd if angleStd is not None else float('nan'):.2f} "
+                f"samples={sampleCount} noise={noiseFlag}"
+            )
+
+        self._show_angle_histogram(angleDeltas)
+        self._dump_debug_frame(
+            measurement=measurement,
+            stats=stats,
+            angleDeltas=angleDeltas,
+        )
+
+    def _show_angle_histogram(self, angleDeltas: Optional[np.ndarray]) -> None:
+        if not self.cfg.debugMode or not self.cfg.showWindows:
+            return
+
+        histHeight = 120
+        histWidth = 240
+        canvas = np.zeros((histHeight, histWidth, 3), dtype=np.uint8)
+
+        if angleDeltas is None or len(angleDeltas) == 0:
+            cv2.putText(
+                canvas,
+                "no angle data",
+                (12, histHeight // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (160, 160, 160),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.imshow("debug-angle-histogram", canvas)
+            return
+
+        rangeMin, rangeMax = self.cfg.debugHistogramRangeDeg
+        bins = histWidth // 4
+        clipped = np.clip(angleDeltas, rangeMin, rangeMax)
+        hist, _ = np.histogram(clipped, bins=bins, range=(rangeMin, rangeMax))
+        hist = hist.astype(np.float32)
+        maxCount = float(hist.max()) if hist.size else 1.0
+        if maxCount <= 0.0:
+            maxCount = 1.0
+
+        for idx, count in enumerate(hist):
+            barHeight = int((count / maxCount) * (histHeight - 20))
+            x0 = idx * 4
+            cv2.rectangle(
+                canvas,
+                (x0, histHeight - 10),
+                (x0 + 3, histHeight - 10 - barHeight),
+                (0, 200, 255),
+                -1,
+            )
+
+        cv2.line(canvas, (0, histHeight - 10), (histWidth - 1, histHeight - 10), (90, 90, 90), 1)
+        cv2.putText(
+            canvas,
+            f"[{rangeMin:.0f},{rangeMax:.0f}] deg",
+            (8, 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (200, 200, 200),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.imshow("debug-angle-histogram", canvas)
+
+    def _dump_debug_frame(
+        self,
+        measurement: "SteeringLKTracker.Measurement",
+        stats: Optional["SteeringLKTracker.AngleStats"],
+        angleDeltas: Optional[np.ndarray],
+    ) -> None:
+        if (
+            not self.cfg.debugMode
+            or self._debugDumpDir is None
+            or self.cfg.debugDumpEvery <= 0
+            or (self.frameIdx % self.cfg.debugDumpEvery) != 0
+        ):
+            return
+
+        pointsSource = measurement.nextPoints
+        if pointsSource is None or len(pointsSource) == 0:
+            pointsSource = self.prevPts
+        points = pointsSource.reshape(-1, 2) if pointsSource is not None else np.empty((0, 2), dtype=np.float32)
+        insideMask = measurement.pointInsideMask
+        radii = measurement.pointRadii
+
+        pointRecords: List[dict] = []
+        appearanceAccepted = measurement.appearanceAccepted
+        for idx, pt in enumerate(points):
+            insideVal: Optional[bool] = None
+            radiusVal: Optional[float] = None
+            if insideMask is not None and idx < len(insideMask):
+                insideVal = bool(insideMask[idx])
+            if radii is not None and idx < len(radii):
+                radiusVal = float(radii[idx])
+            appearanceVal: Optional[bool] = None
+            if appearanceAccepted is not None and idx < len(appearanceAccepted):
+                appearanceVal = bool(appearanceAccepted[idx])
+            pointRecords.append(
+                {
+                    "x": float(pt[0]),
+                    "y": float(pt[1]),
+                    "insideMask": insideVal,
+                    "radius": radiusVal,
+                    "appearanceAccepted": appearanceVal,
+                }
+            )
+
+        statsData: Optional[dict]
+        if stats is not None:
+            statsData = {
+                "median": float(stats.median),
+                "std": float(stats.std),
+                "positiveMean": float(stats.positiveMean) if stats.positiveMean is not None else None,
+                "negativeMean": float(stats.negativeMean) if stats.negativeMean is not None else None,
+                "positiveCount": int(stats.positiveCount),
+                "negativeCount": int(stats.negativeCount),
+                "sampleCount": int(stats.sampleCount),
+            }
+        else:
+            statsData = None
+
+        measurementData = {
+            "valid": bool(measurement.valid),
+            "relativeAngle": float(measurement.relativeAngle),
+            "trackedPoints": int(measurement.trackedPoints),
+            "rawTrackedPoints": int(getattr(measurement, "rawTrackedPoints", measurement.trackedPoints)),
+            "maskRejectedCount": int(getattr(measurement, "maskRejectedCount", 0)),
+            "appearanceRejectedCount": int(getattr(measurement, "appearanceRejectedCount", 0)),
+            "forceReseed": bool(measurement.forceReseed),
+            "motionType": measurement.motionType,
+            "invalidReason": measurement.invalidReason,
+            "medianAngle": float(getattr(measurement, "medianAngle", 0.0)),
+        }
+
+        debugData = {
+            "frameIdx": int(self.frameIdx),
+            "absoluteAngleDeg": float(self.angleDeg),
+            "smoothedAngleDeg": float(self.smoothedAngle),
+            "lastRelativeAngleDeg": float(self.lastRelativeAngle),
+            "center": self.center.tolist() if self.center is not None else None,
+            "radius": float(self.radius) if self.radius is not None else None,
+            "innerRadius": float(self.innerRadius) if self.innerRadius is not None else None,
+            "outerRadius": float(self.outerRadius) if self.outerRadius is not None else None,
+            "points": pointRecords,
+            "measurement": measurementData,
+            "angleStats": statsData,
+            "rawAngleCandidatesDeg": angleDeltas.tolist() if angleDeltas is not None else [],
+        }
+
+        path = os.path.join(self._debugDumpDir, f"frame_{self.frameIdx:06d}.json")
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(debugData, fh, separators=(",", ":"))
+        except OSError as dumpErr:
+            if self.cfg.debugMode:
+                print(f"[dbg] failed to dump frame data: {dumpErr}")
+
+    def _draw_overlay(
+        self,
+        frame: np.ndarray,
+        measurement: Optional["SteeringLKTracker.Measurement"] = None,
+    ) -> np.ndarray:
         if self.center is not None:
             cv2.circle(frame, (int(self.center[0]), int(self.center[1])), 4, (0, 255, 0), -1)
         if self.radius is not None and self.center is not None:
             cv2.circle(frame, (int(self.center[0]), int(self.center[1])), int(self.radius), (0, 128, 255), 2)
-        for p in self.prevPts:
-            cv2.circle(frame, (int(p[0]), int(p[1])), 3, (0, 200, 100), -1)
-        tmp = len(self.prevPts)  
+
+        if measurement is not None and measurement.nextPoints is not None:
+            points = measurement.nextPoints.reshape(-1, 2)
+            insideMask = measurement.pointInsideMask
+        else:
+            points = self.prevPts
+            insideMask = None
+
+        if insideMask is None and points is not None and len(points) > 0:
+            insideMask, _ = self._split_points_by_annulus(points)
+
+        if points is not None:
+            for idx, p in enumerate(points):
+                inside = True
+                if insideMask is not None and idx < len(insideMask):
+                    inside = bool(insideMask[idx])
+                color = (0, 200, 100) if inside else (0, 0, 255)
+                cv2.circle(frame, (int(p[0]), int(p[1])), 3, color, -1)
+
+        trackedCount = (
+            int(measurement.trackedPoints)
+            if measurement is not None
+            else len(self.prevPts)
+        )
+        rawCount = (
+            int(getattr(measurement, "rawTrackedPoints", trackedCount))
+            if measurement is not None
+            else trackedCount
+        )
         cv2.putText(
             frame,
             f"angle: {self.smoothedAngle:.2f} deg ({self.motionType})",
@@ -578,10 +1174,56 @@ class SteeringLKTracker:
             2,
             cv2.LINE_AA,
         )
+
+        dbg = self.latestDebugStats
+        if dbg is not None:
+            cv2.putText(
+                frame,
+                f"pts: {trackedCount}/{rawCount} (mask {dbg.maskRejected}, skin {dbg.appearanceRejected})",
+                (12, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            if dbg.angleStd is not None:
+                cv2.putText(
+                    frame,
+                    f"std: {dbg.angleStd:.2f} deg samples: {dbg.sampleCount}",
+                    (12, 84),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+            if not dbg.measurementValid and dbg.invalidReason:
+                cv2.putText(
+                    frame,
+                    f"invalid: {dbg.invalidReason}",
+                    (12, 108),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 180, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+        else:
+            cv2.putText(
+                frame,
+                f"pts: {trackedCount}",
+                (12, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
         cv2.putText(
             frame,
-            f"pts: {tmp}",
-            (12, 60),
+            f"frame: {self.frameIdx}",
+            (12, 132),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (255, 255, 255),
@@ -596,6 +1238,22 @@ def main() -> None:
     parser.add_argument("--video", dest="video", required=True, help="Path to video (or 0 for camera)")
     parser.add_argument("--debug", dest="debug", action="store_true", help="Debug")
     parser.add_argument("--no-manual", dest="noManual", action="store_true", help="Disable manual click fallback")
+    parser.add_argument("--headless", dest="headless", action="store_true", help="Disable GUI windows")
+    parser.add_argument("--max-frames", dest="max_frames", type=int, default=None, help="Process at most N frames")
+    parser.add_argument(
+        "--align-zero-frames",
+        dest="align_zero_frames",
+        type=int,
+        default=None,
+        help="Override frame streak required before zero realignment (use 0 to disable)",
+    )
+    parser.add_argument(
+        "--align-zero-max-angle",
+        dest="align_zero_max_angle",
+        type=float,
+        default=None,
+        help="Override max absolute angle (deg) eligible for zero realignment",
+    )
     args = parser.parse_args()
 
     videoSource = args.video
@@ -606,9 +1264,17 @@ def main() -> None:
     config = TrackerConfig(
         allowManualClick=not args.noManual,
         debugMode=args.debug,
+        showWindows=not args.headless,
     )
+    if args.align_zero_frames is not None:
+        if args.align_zero_frames <= 0:
+            config.alignZeroFrameThreshold = 10**9
+        else:
+            config.alignZeroFrameThreshold = args.align_zero_frames
+    if args.align_zero_max_angle is not None:
+        config.alignZeroMaxAbsAngle = args.align_zero_max_angle
     tracker = SteeringLKTracker(config)
-    tracker.run(videoSource)
+    tracker.run(videoSource, maxFrames=args.max_frames)
 
 
 if __name__ == "__main__":
