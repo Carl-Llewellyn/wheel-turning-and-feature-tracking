@@ -1,4 +1,5 @@
 #If anyone actually reads this. This mostly works and could be made to fully work.
+#Although it detects ~-360 to +360 deg for my car. It should be a lot more than this haha.
 #It will detect the wheel angle quite well. However, the only way I could get this to consistently work
 #was by just resetting the feature detection, etc. every 5 seconds. It may work better for you.
 #I also made this in the summer and used it in late Autumn. This could be a source of a lot of the issues as
@@ -11,12 +12,14 @@ import argparse
 import math
 
 import sys
+import os
+import mmap
+import struct
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-import pandas as pd
 
 
 @dataclass
@@ -66,6 +69,10 @@ class SteeringLKTracker:
         self.lastReseedFrame: int = 0
         self.periodicResetIntervalFrames: int = 0
         self.lastPeriodicResetFrame: int = 0
+        self.shmFd: Optional[int] = None
+        self.shmMap: Optional[mmap.mmap] = None
+        self.shmPath = "/dev/shm/steering_angle"
+        self.shmSize = 8  #double buffer only
 
     def resetDetection(
         self,
@@ -124,7 +131,49 @@ class SteeringLKTracker:
                 f"[reset] detection reset (resetAngle={resetAngle}, wheelDetectionReset={wheelDetectionReset})"
             )
 
-    def run(self, videoSource: str) -> pd.DataFrame:
+    def _initSharedMem(self) -> None:
+        if self.shmMap is not None:
+            return
+        try:
+            fd = os.open(self.shmPath, os.O_CREAT | os.O_RDWR, 0o666)
+            os.ftruncate(fd, self.shmSize)
+            mm = mmap.mmap(fd, self.shmSize, mmap.MAP_SHARED, mmap.PROT_WRITE)
+        except OSError as shmErr:
+            if "fd" in locals():
+                os.close(fd)
+            if self.cfg.debugMode:
+                print("shm err", shmErr)
+            self.shmFd = None
+            self.shmMap = None
+            return
+        self.shmFd = fd
+        self.shmMap = mm
+        self._writeSharedAngle(float("nan"))  #start as NaN so reader knows it's not ready
+
+    def _writeSharedAngle(self, angleVal: float) -> None:
+        if self.shmMap is None:
+            return
+        try:
+            self.shmMap.seek(0)
+            self.shmMap.write(struct.pack("<d", angleVal))
+            self.shmMap.flush()
+        except (OSError, ValueError) as writeErr:
+            if self.cfg.debugMode:
+                print("shm write??", writeErr)
+
+    def _closeSharedMem(self) -> None:
+        if self.shmMap is not None:
+            try:
+                self.shmMap.close()
+            except BufferError:
+                if self.cfg.debugMode:
+                    print("shm close buffer busy?")
+            self.shmMap = None
+        if self.shmFd is not None:
+            os.close(self.shmFd)
+            self.shmFd = None
+
+    def run(self, videoSource: str) -> None:
         cap = cv2.VideoCapture(videoSource)
         if not cap.isOpened():
             print(f"Cannot open video: {videoSource}", file=sys.stderr)
@@ -141,10 +190,10 @@ class SteeringLKTracker:
             dbgFps = cap.get(cv2.CAP_PROP_FPS)
             if self.cfg.debugMode:
                 print("cam-set?", dbgWidth, dbgHeight, dbgFps)
-            
+
+        self._initSharedMem()
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         #TODO(fixlater) usb camera lies about fps sometimes but i eyeball it.
-        results: List[dict] = []
 
         ok, frame = cap.read()
         if not ok:
@@ -185,17 +234,10 @@ class SteeringLKTracker:
 
             vis = self._draw_overlay(frame.copy())
             cv2.imshow("steering-lk", vis)
-            results.append(
-                {
-                    "frame": self.frameIdx,
-                    "timeSec": timeSec,
-                    "angleDeg": float(self.smoothedAngle),
-                    "rawAngleDeg": float(self.angleDeg),
-                    "motionType": self.motionType,
-                    "valid": measurement.valid,
-                    "trackedPoints": int(measurement.trackedPoints),
-                }
-            )
+            if measurement.valid:
+                self._writeSharedAngle(float(self.smoothedAngle))
+            else:
+                self._writeSharedAngle(float("nan"))
 
             self.prevGray = gray
             self.prevPts = measurement.nextPoints.reshape(-1, 2) if measurement.nextPoints is not None else np.empty((0, 2))
@@ -218,12 +260,8 @@ class SteeringLKTracker:
 
         cap.release()
         cv2.destroyAllWindows()
-
-        df = pd.DataFrame(results) 
-        csvPath = "angles.csv"
-        df.to_csv(csvPath, index=False)
-        print(f"Saved {len(df)} rows to {csvPath}")
-        return df
+        self._writeSharedAngle(float("nan"))  #tell downstream we're idle now.
+        self._closeSharedMem()
 
     def _initialise_from_first_frame(self, frame: np.ndarray) -> None:
         h, w = frame.shape[:2]
