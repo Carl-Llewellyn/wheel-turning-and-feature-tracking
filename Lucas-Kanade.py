@@ -68,6 +68,9 @@ class TrackerConfig:
     showWindows: bool = True
     alignZeroFrameThreshold: int = 45
     alignZeroMaxAbsAngle: float = 120.0
+    useClahe: bool = True
+    claheClipLimit: float = 2.5
+    claheTileGrid: Tuple[int, int] = (8, 8)
 
 
 class SteeringLKTracker:
@@ -107,6 +110,14 @@ class SteeringLKTracker:
         self.maxFrames: Optional[int] = None
         self.lastWheelRefreshFrame: int = 0
         self.rectZeroStreak: int = 0
+        self._clahe = (
+            cv2.createCLAHE(
+                clipLimit=self.cfg.claheClipLimit,
+                tileGridSize=self.cfg.claheTileGrid,
+            )
+            if self.cfg.useClahe
+            else None
+        )
 
     def resetDetection(
         self,
@@ -156,6 +167,7 @@ class SteeringLKTracker:
             self._initialise_from_first_frame(frameBgr)
 
         gray = cv2.cvtColor(frameBgr, cv2.COLOR_BGR2GRAY)
+        gray = self._preprocess_gray(gray)
         self.prevGray = gray
 
         p0 = self._detect_features(gray, useMask=self.mask is not None)
@@ -243,6 +255,7 @@ class SteeringLKTracker:
 
         self._initialise_from_first_frame(frame)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = self._preprocess_gray(gray)
         self.prevGray = gray
         self.prevPts = self._detect_features(gray, useMask=True)
         self.prevPts = self.prevPts.reshape(-1, 2) if self.prevPts is not None else np.empty((0, 2))
@@ -268,6 +281,7 @@ class SteeringLKTracker:
                 break
             self.frameIdx += 1
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = self._preprocess_gray(gray)
 
             measurement = self._process_frame(gray, frame=frame)
             self._apply_measurement(measurement)
@@ -432,6 +446,11 @@ class SteeringLKTracker:
             if self.cfg.debugMode:
                 print(f"[dbg] failed to dump wheel geometry: {dumpErr}")
 
+    def _preprocess_gray(self, gray: np.ndarray) -> np.ndarray:
+        if self._clahe is not None:
+            return self._clahe.apply(gray)
+        return gray
+
     @dataclass
     class Measurement:
         valid: bool
@@ -449,6 +468,8 @@ class SteeringLKTracker:
         maskRejectedCount: int = 0
         appearanceRejectedCount: int = 0
         medianAngle: float = 0.0
+        globalAngle: float = 0.0
+        affineAngle: float = 0.0
 
     @dataclass
     class DebugFrameStats:
@@ -470,6 +491,8 @@ class SteeringLKTracker:
         positiveCount: int
         negativeCount: int
         noiseFlag: bool
+        globalAngle: float
+        affineAngle: float
 
     def _process_frame(self, gray: np.ndarray, frame: Optional[np.ndarray] = None) -> "SteeringLKTracker.Measurement":
         if self.prevGray is None:
@@ -535,6 +558,8 @@ class SteeringLKTracker:
                 maskRejectedCount=maskRejectedCount,
                 appearanceRejectedCount=appearanceRejectedCount,
                 medianAngle=0.0,
+                globalAngle=0.0,
+                affineAngle=0.0,
             )
             self._record_frame_debug(
                 measurement=measurement,
@@ -545,11 +570,19 @@ class SteeringLKTracker:
             )
             return measurement
 
-        angleDeltas = self._compute_angleDeltas(prevPtsValid, nextPts)
-        stats = self._angle_statistics(angleDeltas)
+        angleDeltas, prevVectors, nextVectors = self._compute_angleDeltas(prevPtsValid, nextPts)
+        if radii is not None and len(radii) == len(angleDeltas):
+            weights = np.clip(radii, 1.0, None)
+        else:
+            weights = np.clip(np.linalg.norm(prevVectors, axis=1), 1.0, None)
+        stats = self._angle_statistics(angleDeltas, weights)
+        globalAngle = self._estimate_global_rotation(prevVectors, nextVectors, weights)
+        affineAngle = self._estimate_affine_rotation(prevPtsValid, nextPts)
         noiseFlag = self._detect_horizontal_noise(self.prevGray, gray)
-        motionType = self._classify_motion(stats, predictedAngle=self.angleDeg + stats.median)
-        relativeAngle, measureValid = self._decide_relativeAngle(stats, motionType, noiseFlag)
+        motionType = self._classify_motion(stats, predictedAngle=self.angleDeg + stats.weightedMean)
+        relativeAngle, measureValid = self._decide_relativeAngle(
+            stats, motionType, noiseFlag, globalAngle, affineAngle
+        )
 
         invalidReason = None
         if not measureValid:
@@ -578,6 +611,8 @@ class SteeringLKTracker:
             maskRejectedCount=maskRejectedCount,
             appearanceRejectedCount=appearanceRejectedCount,
             medianAngle=stats.median,
+            globalAngle=globalAngle,
+            affineAngle=float(affineAngle) if affineAngle is not None else 0.0,
         )
         self._record_frame_debug(
             measurement=measurement,
@@ -605,7 +640,8 @@ class SteeringLKTracker:
         self.angleDeg = self._maybe_align_zero(self.angleDeg)
 
         if measurement.trackedPoints >= self.cfg.minAngleSamples:
-            if abs(measurement.medianAngle) < self.cfg.alignBackToZeroDeg:
+            angleForStreak = measurement.globalAngle if measurement.globalAngle else measurement.medianAngle
+            if abs(angleForStreak) < self.cfg.alignBackToZeroDeg:
                 self.rectZeroStreak += 1
             else:
                 self.rectZeroStreak = 0
@@ -643,6 +679,8 @@ class SteeringLKTracker:
             self.latestDebugStats.motionType = self.motionType
             self.latestDebugStats.measurementValid = bool(measurement.valid)
             self.latestDebugStats.invalidReason = measurement.invalidReason
+            self.latestDebugStats.globalAngle = float(measurement.globalAngle)
+            self.latestDebugStats.affineAngle = float(measurement.affineAngle)
 
     def _maybe_reseed(self, gray: np.ndarray, force: bool) -> None:
         needReseed = force or (self.frameIdx - self.lastReseedFrame > self.cfg.redetectEveryNFrames)
@@ -803,13 +841,17 @@ class SteeringLKTracker:
     class AngleStats:
         median: float
         std: float
+        weightedMean: float
+        weightedStd: float
         positiveMean: Optional[float]
         negativeMean: Optional[float]
         positiveCount: int
         negativeCount: int
         sampleCount: int
 
-    def _compute_angleDeltas(self, prevPts: np.ndarray, nextPts: np.ndarray) -> np.ndarray:
+    def _compute_angleDeltas(
+        self, prevPts: np.ndarray, nextPts: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         center = self.center if self.center is not None else np.array([0.0, 0.0], dtype=np.float32)
         prevVectors = prevPts - center
         nextVectors = nextPts - center
@@ -819,11 +861,23 @@ class SteeringLKTracker:
         angleDelta = rawDelta 
         #map to [-180, 180]
         rawDelta = (angleDelta + 180.0) % 360.0 - 180.0
-        return rawDelta.astype(np.float32)
+        return rawDelta.astype(np.float32), prevVectors, nextVectors
 
-    def _angle_statistics(self, deltaAngles: np.ndarray) -> AngleStats:
+    def _angle_statistics(
+        self, deltaAngles: np.ndarray, weights: Optional[np.ndarray]
+    ) -> AngleStats:
         if deltaAngles.size == 0:
-            return self.AngleStats(0.0, float("inf"), None, None, 0, 0, 0)
+            return self.AngleStats(
+                median=0.0,
+                std=float("inf"),
+                weightedMean=0.0,
+                weightedStd=float("inf"),
+                positiveMean=None,
+                negativeMean=None,
+                positiveCount=0,
+                negativeCount=0,
+                sampleCount=0,
+            )
 
         mask = np.abs(deltaAngles) > self.cfg.nearZeroThresholdDeg
         filtered = deltaAngles[mask]
@@ -832,6 +886,8 @@ class SteeringLKTracker:
             return self.AngleStats(
                 median=0.0,
                 std=0.0,
+                weightedMean=0.0,
+                weightedStd=0.0,
                 positiveMean=None,
                 negativeMean=None,
                 positiveCount=0,
@@ -839,8 +895,27 @@ class SteeringLKTracker:
                 sampleCount=sampleCount,
             )
 
+        weightFiltered = None
+        if weights is not None and len(weights) == len(deltaAngles):
+            weightFiltered = weights[mask]
+            if weightFiltered.size == 0:
+                weightFiltered = None
+
         median = float(np.median(filtered))
-        std = float(np.std(filtered))
+        std = float(np.std(filtered)) if filtered.size > 1 else 0.0
+
+        if weightFiltered is not None and float(np.sum(weightFiltered)) > 1e-6:
+            weightedMean = float(np.sum(weightFiltered * filtered) / np.sum(weightFiltered))
+            diff = filtered - weightedMean
+            weightedStd = float(
+                math.sqrt(
+                    max(np.sum(weightFiltered * diff * diff) / np.sum(weightFiltered), 0.0)
+                )
+            )
+        else:
+            weightedMean = median
+            weightedStd = std
+
         positive = filtered[filtered > 0]
         negative = filtered[filtered < 0]
 
@@ -850,12 +925,58 @@ class SteeringLKTracker:
         return self.AngleStats(
             median=median,
             std=std,
+            weightedMean=weightedMean,
+            weightedStd=weightedStd,
             positiveMean=positiveMean,
             negativeMean=negativeMean,
             positiveCount=int(positive.size),
             negativeCount=int(negative.size),
             sampleCount=int(filtered.size),
         )
+
+    def _estimate_global_rotation(
+        self, prevVectors: np.ndarray, nextVectors: np.ndarray, weights: Optional[np.ndarray]
+    ) -> float:
+        if prevVectors.size == 0 or nextVectors.size == 0:
+            return 0.0
+        if weights is None or len(weights) != len(prevVectors):
+            w = np.ones(len(prevVectors), dtype=np.float64)
+        else:
+            w = weights.astype(np.float64)
+        cross = prevVectors[:, 0] * nextVectors[:, 1] - prevVectors[:, 1] * nextVectors[:, 0]
+        dot = prevVectors[:, 0] * nextVectors[:, 0] + prevVectors[:, 1] * nextVectors[:, 1]
+        sumCross = float(np.sum(w * cross))
+        sumDot = float(np.sum(w * dot))
+        if abs(sumCross) < 1e-8 and abs(sumDot) < 1e-8:
+            return 0.0
+        return math.degrees(math.atan2(sumCross, sumDot))
+
+    def _estimate_affine_rotation(self, prevPts: np.ndarray, nextPts: np.ndarray) -> Optional[float]:
+        if len(prevPts) < 3 or len(nextPts) < 3:
+            return None
+        center = self.center if self.center is not None else np.array([0.0, 0.0], dtype=np.float32)
+        prevShift = prevPts - center
+        nextShift = nextPts - center
+        try:
+            M, inliers = cv2.estimateAffine2D(
+                prevShift,
+                nextShift,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=2.0,
+                maxIters=2000,
+                confidence=0.995,
+            )
+        except cv2.error:
+            return None
+        if M is None:
+            return None
+        rotMat = M[:, :2]
+        if not np.isfinite(rotMat).all():
+            return None
+        angle = math.degrees(math.atan2(rotMat[1, 0], rotMat[0, 0]))
+        if not math.isfinite(angle):
+            return None
+        return angle
 
     def _classify_motion(self, stats: AngleStats, predictedAngle: float) -> str:
         prevMotion = self.motionType
@@ -876,7 +997,12 @@ class SteeringLKTracker:
         return "curve"
 
     def _decide_relativeAngle(
-        self, stats: AngleStats, motionType: str, noiseFlag: bool
+        self,
+        stats: AngleStats,
+        motionType: str,
+        noiseFlag: bool,
+        globalAngle: float,
+        affineAngle: Optional[float],
     ) -> Tuple[float, bool]:
         if stats.sampleCount < self.cfg.minAngleSamples:
             return 0.0, False
@@ -885,16 +1011,45 @@ class SteeringLKTracker:
         if noiseFlag:
             return 0.0, False
 
-        if motionType == "rect":
-            relAngle = stats.median
-        else:
-            if stats.positiveCount >= stats.negativeCount and stats.positiveMean is not None:
-                relAngle = stats.positiveMean
-            elif stats.negativeMean is not None:
-                relAngle = stats.negativeMean
-            else:
-                relAngle = stats.median
+        def add_candidate(val: Optional[float], weight: float) -> None:
+            if val is None:
+                return
+            if not math.isfinite(val):
+                return
+            if signPreference == 1 and val < -self.cfg.nearZeroThresholdDeg:
+                return
+            if signPreference == -1 and val > self.cfg.nearZeroThresholdDeg:
+                return
+            candidates.append((val, weight))
 
+        signPreference = 0
+        if stats.positiveCount > stats.negativeCount:
+            signPreference = 1
+        elif stats.negativeCount > stats.positiveCount:
+            signPreference = -1
+
+        candidates: list[tuple[float, float]] = []
+
+        add_candidate(stats.weightedMean, 4.0)
+        add_candidate(stats.median, 2.0)
+        add_candidate(globalAngle, 3.0)
+        if affineAngle is not None:
+            add_candidate(affineAngle, 5.0)
+
+        if motionType == "curve":
+            if stats.positiveMean is not None:
+                add_candidate(stats.positiveMean, 3.0)
+            if stats.negativeMean is not None:
+                add_candidate(stats.negativeMean, 3.0)
+
+        if not candidates:
+            return 0.0, False
+
+        totalWeight = sum(w for _, w in candidates)
+        if totalWeight <= 0.0:
+            return 0.0, False
+
+        relAngle = sum(val * weight for val, weight in candidates) / totalWeight
         return relAngle, True
 
     def _detect_horizontal_noise(self, prevGray: np.ndarray, gray: np.ndarray) -> bool:
@@ -930,7 +1085,7 @@ class SteeringLKTracker:
         appearanceRejected = int(getattr(measurement, "appearanceRejectedCount", 0))
 
         angleMedian = stats.median if stats is not None else None
-        angleStd = stats.std if stats is not None else None
+        angleStd = stats.weightedStd if stats is not None else None
         positiveCount = stats.positiveCount if stats is not None else 0
         negativeCount = stats.negativeCount if stats is not None else 0
         sampleCount = stats.sampleCount if stats is not None else 0
@@ -954,6 +1109,8 @@ class SteeringLKTracker:
             positiveCount=positiveCount,
             negativeCount=negativeCount,
             noiseFlag=noiseFlag,
+            globalAngle=float(measurement.globalAngle),
+            affineAngle=float(measurement.affineAngle),
         )
         self.latestDebugStats = debugEntry
         self.debugHistory.append(debugEntry)
@@ -967,7 +1124,9 @@ class SteeringLKTracker:
                 f"[dbg] frame {debugEntry.frameIdx:05d} "
                 f"tracked={tracked} raw={rawTracked} in={inCount} maskRej={outCount} skinRej={appearanceRejected} "
                 f"valid={measurement.valid} reason={reason} "
-                f"angle={measurement.relativeAngle:.2f} std={angleStd if angleStd is not None else float('nan'):.2f} "
+                f"angle={measurement.relativeAngle:.2f} global={measurement.globalAngle:.2f} "
+                f"affine={measurement.affineAngle:.2f} "
+                f"std={angleStd if angleStd is not None else float('nan'):.2f} "
                 f"samples={sampleCount} noise={noiseFlag}"
             )
 
@@ -1101,6 +1260,8 @@ class SteeringLKTracker:
             "motionType": measurement.motionType,
             "invalidReason": measurement.invalidReason,
             "medianAngle": float(getattr(measurement, "medianAngle", 0.0)),
+            "globalAngle": float(getattr(measurement, "globalAngle", 0.0)),
+            "affineAngle": float(getattr(measurement, "affineAngle", 0.0)),
         }
 
         debugData = {
@@ -1198,11 +1359,31 @@ class SteeringLKTracker:
                     1,
                     cv2.LINE_AA,
                 )
+            cv2.putText(
+                frame,
+                f"global: {dbg.globalAngle:.2f} deg",
+                (12, 108),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (200, 255, 200),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                frame,
+                f"aff: {dbg.affineAngle:.2f} deg",
+                (12, 132),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (200, 200, 255),
+                1,
+                cv2.LINE_AA,
+            )
             if not dbg.measurementValid and dbg.invalidReason:
                 cv2.putText(
                     frame,
                     f"invalid: {dbg.invalidReason}",
-                    (12, 108),
+                    (12, 156),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
                     (0, 180, 255),
