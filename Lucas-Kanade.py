@@ -16,6 +16,7 @@ import os
 import mmap
 import struct
 import json
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Tuple
@@ -214,8 +215,20 @@ class SteeringLKTracker:
             os.close(self.shmFd)
             self.shmFd = None
 
-    def run(self, videoSource: str, maxFrames: Optional[int] = None) -> None:
-        cap = cv2.VideoCapture(videoSource)
+    def run(
+        self,
+        videoSource: str | int,
+        maxFrames: Optional[int] = None,
+        outputPath: Optional[str] = None,
+    ) -> None:
+        cap: cv2.VideoCapture
+        if isinstance(videoSource, int):
+            cap = cv2.VideoCapture(videoSource, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(videoSource)
+        else:
+            cap = cv2.VideoCapture(videoSource)
         if not cap.isOpened():
             print(f"Cannot open video: {videoSource}", file=sys.stderr)
             sys.exit(1)
@@ -233,13 +246,81 @@ class SteeringLKTracker:
                 print("cam-set?", dbgWidth, dbgHeight, dbgFps)
 
         self._initSharedMem()
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        requestedFps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        writer: Optional[cv2.VideoWriter] = None
+        writerPath: Optional[str] = None
+        writerBuffer: List[np.ndarray] = []
+        writerStartTime: Optional[float] = None
+        writerLastTime: Optional[float] = None
+        writerFrameCount: int = 0
+        measuredFps: Optional[float] = None
         #TODO(fixlater) usb camera lies about fps sometimes but i eyeball it.
 
         ok, frame = cap.read()
         if not ok:
-            print("Vid empty.", file=sys.stderr)
-            sys.exit(1)
+            retries = 3 if isinstance(videoSource, int) else 0
+            for attempt in range(retries):
+                time.sleep(0.05)
+                ok, frame = cap.read()
+                if ok:
+                    break
+            if not ok:
+                print("Vid empty.", file=sys.stderr)
+                cap.release()
+                sys.exit(1)
+
+        if outputPath is not None and isinstance(videoSource, int):
+            try:
+                writerPath = os.path.abspath(outputPath)
+                outputDir = os.path.dirname(writerPath)
+                os.makedirs(outputDir, exist_ok=True)
+            except OSError as writerErr:
+                print(f"Cannot prepare video writer directory: {writerErr}", file=sys.stderr)
+                writerPath = None
+
+        def _record_frame(frame_to_write: np.ndarray) -> None:
+            nonlocal writer, writerBuffer, writerStartTime, writerFrameCount, measuredFps, writerPath, writerLastTime
+            if writerPath is None:
+                return
+            now = time.perf_counter()
+            if writerStartTime is None:
+                writerStartTime = now
+            writerLastTime = now
+            writerFrameCount += 1
+
+            if writer is None:
+                writerBuffer.append(frame_to_write)
+                elapsed = max(now - writerStartTime, 0.0)
+                enoughFrames = writerFrameCount >= 30 and elapsed >= 1.0
+                tooLong = elapsed >= 3.0
+                if not (enoughFrames or tooLong):
+                    return
+                measuredFps = max(writerFrameCount / max(elapsed, 1e-6), 1.0)
+                frameHeight, frameWidth = frame_to_write.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                writer = cv2.VideoWriter(
+                    writerPath,
+                    fourcc,
+                    float(measuredFps),
+                    (frameWidth, frameHeight),
+                )
+                if not writer.isOpened():
+                    print(f"Cannot open video writer: {writerPath}", file=sys.stderr)
+                    writer.release()
+                    writer = None
+                    writerPath = None
+                    writerBuffer.clear()
+                    return
+                for buffered in writerBuffer:
+                    writer.write(buffered)
+                writerBuffer.clear()
+                if self.cfg.debugMode:
+                    print(
+                        f"[dbg] video writer initialised at {measuredFps:.3f} fps "
+                        f"({writerFrameCount} frames buffered)"
+                    )
+            else:
+                writer.write(frame_to_write)
 
         self._initialise_from_first_frame(frame)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -254,13 +335,16 @@ class SteeringLKTracker:
         self.lastRelativeAngle = 0.0
         self.angleHistory = [0.0]
         self.lastReseedFrame = 0
-        self.periodicResetIntervalFrames = max(1, int(round(fps * 5.0)))
+        self.periodicResetIntervalFrames = max(1, int(round(requestedFps * 5.0)))
 
         #Can't get this to work for long periods of time. Resetting every 5 secs makes it work well enough.
         quickResetTick = self.periodicResetIntervalFrames  
         if self.cfg.debugMode and quickResetTick < 240:
             print("resetTick?", quickResetTick)
         self.lastPeriodicResetFrame = 0
+
+        initialRender = self._draw_overlay(frame.copy(), measurement=None)
+        _record_frame(initialRender)
 
         while True:
             ok, frame = cap.read()
@@ -274,9 +358,18 @@ class SteeringLKTracker:
             self._maybe_reseed(gray, force=measurement.forceReseed)
             self._maybe_refresh_wheel_geometry(frame)
 
-            if self.cfg.showWindows:
-                vis = self._draw_overlay(frame.copy(), measurement)
-                cv2.imshow("steering-lk", vis)
+            needsRender = (writerPath is not None and (writer is not None or writerBuffer)) or self.cfg.showWindows
+            renderFrame: Optional[np.ndarray] = None
+            if needsRender:
+                renderFrame = self._draw_overlay(frame.copy(), measurement)
+
+            if renderFrame is not None:
+                _record_frame(renderFrame)
+
+            if self.cfg.showWindows and renderFrame is not None:
+                cv2.imshow("steering-lk", renderFrame)
+            elif self.cfg.showWindows:
+                cv2.imshow("steering-lk", frame)
 
             if measurement.valid:
                 self._writeSharedAngle(float(self.smoothedAngle))
@@ -303,6 +396,39 @@ class SteeringLKTracker:
                     self.resetDetection(resetAngle=True, wheelDetectionReset=True, currentFrame=frame)
 
         cap.release()
+        if writerPath is not None and writer is None and writerBuffer:
+            finalNow = time.perf_counter()
+            if writerStartTime is None:
+                writerStartTime = finalNow
+            if writerLastTime is None:
+                writerLastTime = finalNow
+            totalElapsed = max(writerLastTime - writerStartTime, 1e-6)
+            measuredFps = max(writerFrameCount / totalElapsed, 1.0)
+            frameHeight, frameWidth = writerBuffer[0].shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+            writer = cv2.VideoWriter(
+                writerPath,
+                fourcc,
+                float(measuredFps),
+                (frameWidth, frameHeight),
+            )
+            if writer.isOpened():
+                for buffered in writerBuffer:
+                    writer.write(buffered)
+                writerBuffer.clear()
+            else:
+                print(f"Cannot open video writer: {writerPath}", file=sys.stderr)
+                writer.release()
+                writer = None
+        if writer is not None:
+            writer.release()
+            if writerStartTime is not None and writerLastTime is not None and writerFrameCount > 0:
+                totalElapsed = max(writerLastTime - writerStartTime, 1e-6)
+                finalFps = writerFrameCount / totalElapsed
+                print(
+                    f"[record] saved {writerFrameCount} frames over {totalElapsed:.2f}s "
+                    f"(~{finalFps:.3f} fps metadata)"
+                )
         if self.cfg.showWindows:
             cv2.destroyAllWindows()
         self._writeSharedAngle(float("nan"))  #tell downstream we're idle now.
@@ -1241,6 +1367,12 @@ def main() -> None:
     parser.add_argument("--headless", dest="headless", action="store_true", help="Disable GUI windows")
     parser.add_argument("--max-frames", dest="max_frames", type=int, default=None, help="Process at most N frames")
     parser.add_argument(
+        "--output",
+        dest="output_path",
+        default=None,
+        help="Save webcam capture to the given video file (MJPG codec)",
+    )
+    parser.add_argument(
         "--align-zero-frames",
         dest="align_zero_frames",
         type=int,
@@ -1256,10 +1388,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    videoSource = args.video
-
-    if videoSource.isdigit():
-        videoSource = int(videoSource)
+    videoArg = args.video
+    isCameraSource = videoArg.isdigit()
+    videoSource = int(videoArg) if isCameraSource else videoArg
+    outputPath = args.output_path if isCameraSource else None
+    if args.output_path and not isCameraSource:
+        print("--output flag is only supported with webcam sources; ignoring.", file=sys.stderr)
 
     config = TrackerConfig(
         allowManualClick=not args.noManual,
@@ -1274,7 +1408,7 @@ def main() -> None:
     if args.align_zero_max_angle is not None:
         config.alignZeroMaxAbsAngle = args.align_zero_max_angle
     tracker = SteeringLKTracker(config)
-    tracker.run(videoSource, maxFrames=args.max_frames)
+    tracker.run(videoSource, maxFrames=args.max_frames, outputPath=outputPath)
 
 
 if __name__ == "__main__":
