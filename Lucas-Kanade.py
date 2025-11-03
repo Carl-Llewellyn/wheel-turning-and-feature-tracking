@@ -17,6 +17,7 @@ import mmap
 import struct
 import json
 import time
+from datetime import datetime
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Tuple
@@ -1370,7 +1371,7 @@ def main() -> None:
         "--output",
         dest="output_path",
         default=None,
-        help="Save webcam capture to the given video file (MJPG codec)",
+        help="Directory where webcam recordings are saved using timestamped filenames (MJPG codec)",
     )
     parser.add_argument(
         "--align-zero-frames",
@@ -1391,9 +1392,23 @@ def main() -> None:
     videoArg = args.video
     isCameraSource = videoArg.isdigit()
     videoSource = int(videoArg) if isCameraSource else videoArg
-    outputPath = args.output_path if isCameraSource else None
+    outputPath: Optional[str] = None
     if args.output_path and not isCameraSource:
         print("--output flag is only supported with webcam sources; ignoring.", file=sys.stderr)
+    elif isCameraSource and args.output_path:
+        outputBase = os.path.abspath(args.output_path)
+        outputDir = outputBase
+        if not os.path.isdir(outputBase):
+            baseName = os.path.basename(outputBase)
+            root, ext = os.path.splitext(baseName)
+            if ext:
+                outputDir = os.path.dirname(outputBase) or os.getcwd()
+            else:
+                outputDir = outputBase
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        outputPath = os.path.join(outputDir, f"{timestamp}.avi")
+        if args.debug:
+            print(f"[dbg] recording to {outputPath}")
 
     config = TrackerConfig(
         allowManualClick=not args.noManual,
